@@ -11,17 +11,20 @@ from aiogram.fsm.context import FSMContext
 
 from app.config import ADMIN_IDS, GROUP_ID, EVENTS_THREAD_ID, REGISTRATION_THREAD_ID
 from app.db import connect
-from app.events import send_race_message, notify_all_drivers, delivery_report, message_pages
-from app.handlers.common import send_with_photo, edit_or_send
+from app.events import send_race_message, notify_all_drivers, delivery_report, message_pages, safe_send, purge_service
+from app.race_ops import apply_pending_bans
+from app.handlers.common import send_with_photo, edit_or_send, refresh_home_screens
 from app.handlers.reserve import finish_registration, registration_stats
 from app.handlers.register import send_pending
 from app.keyboards import (
     admin_menu_kb, admin_back_kb, role_choice_kb, team_pick_kb, confirm_close_kb,
 )
-from app.defaults import DEFAULT_TEAMS, car_number_error, ALLOWED_CAR_NUMBERS_TEXT
+from app.defaults import DEFAULT_TEAMS, car_number_error
 from app.parser import parse_profile
-from app.services import create_driver, teams_with_counts
+from app.services import create_driver, teams_with_counts, free_car_numbers, free_numbers_text
 from app import texts
+
+from app import ui
 
 router = Router()
 
@@ -161,7 +164,7 @@ async def publish_race(bot, name, race_at, hours, thread_id):
     if not 1 <= len(name) <= 120:
         return "Название должно содержать от 1 до 120 символов.", None
     if not 0 <= hours <= 336:
-        return "Ориентир подтверждения должен быть от 0 до 336 часов.", None
+        return "Закрытие регистрации — от 0 до 336 часов до старта.", None
     deadline = race_at - timedelta(hours=hours)
     async with connect() as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -170,11 +173,13 @@ async def publish_race(bot, name, race_at, hours, thread_id):
         if old:
             return f"Уже открыт этап «{esc(old[0])}». Сначала заверши его кнопкой «Завершить этап».", None
         cur = await db.execute(
-            "INSERT INTO races(name,race_at,main_deadline,thread_id) VALUES(?,?,?,?)",
+            "INSERT INTO races(name,race_at,main_deadline,thread_id,auto_close) VALUES(?,?,?,?,1)",
             (name, race_at.isoformat(), deadline.isoformat(), thread_id),
         )
         rid = cur.lastrowid
         await db.execute("INSERT INTO entries(race_id,driver_id,status) SELECT ?,id,'pending' FROM drivers WHERE role='main'", (rid,))
+        # Штрафной пропуск, назначенный заранее, применяется к этому этапу
+        banned = await apply_pending_bans(db, rid)
         await db.commit()
     announcement = texts.RACE_OPENED.format(
         name=esc(name), race_at=race_at.strftime("%d.%m.%Y %H:%M") + " (МСК)",
@@ -182,14 +187,20 @@ async def publish_race(bot, name, race_at, hours, thread_id):
     )
     group_sent = await send_race_message(bot, rid, announcement)
     sent, failed, unlinked = await notify_all_drivers(bot, announcement)
-    return f"✅ <b>{esc(name)}</b> — регистрация открыта.\n" + delivery_report(sent, failed, unlinked, group_sent), rid
+    for _, _, tg_id in banned:
+        if tg_id:
+            await safe_send(bot, tg_id, f"🚫 <b>Штраф:</b> решением админа ты пропускаешь этап <b>{esc(name)}</b>.")
+    report = f"✅ <b>{esc(name)}</b> — регистрация открыта.\n" + delivery_report(sent, failed, unlinked, group_sent)
+    if banned:
+        report += "\n🚫 Пропускают по штрафу: " + ", ".join(esc(b[1]) for b in banned)
+    return report, rid
 
 
 async def start_wizard(message, state, actor_id):
     await state.clear()
     await state.set_state(Flow.race_name)
     await state.update_data(gp_token=secrets.token_hex(4), gp_thread=await choose_thread(message))
-    await message.answer(
+    await ui.answer(message, 
         f"🏁 <b>Новый Гран-при · шаг 1/5</b>\n\n<a href='tg://user?id={actor_id}'>Администратор</a>, "
         "Напиши название этапа, например: <b>Гран-при Бахрейн</b>.\n"
         "В группе ответь именно на это сообщение. Для отмены — /cancel или кнопка «Назад» в админке.",
@@ -221,12 +232,12 @@ async def cmd_open(message: Message, state: FSMContext):
         race_at = datetime.strptime(date_string, "%d.%m.%Y %H:%M").replace(tzinfo=MSK)
         hours = int(hours_string)
     except ValueError:
-        await message.reply("Не удалось прочитать дату. Нажми «➕ Объявить Гран-при» в /admin — там всё выбирается по шагам.")
+        await ui.reply(message, "Не удалось прочитать дату. Нажми «➕ Объявить Гран-при» в /admin — там всё выбирается по шагам.")
         return
     await state.clear()
-    await message.reply("⏳ Создаю этап и отправляю уведомления…")
+    await ui.reply(message, "⏳ Создаю этап и отправляю уведомления…")
     result, _ = await publish_race(message.bot, name, race_at, hours, await choose_thread(message))
-    await message.reply(result, reply_markup=admin_menu_kb())
+    await ui.reply(message, result, reply_markup=admin_menu_kb())
 
 
 @router.message(Command("cancel", ignore_case=True))
@@ -234,7 +245,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
     if not await allowed(message):
         return
     await state.clear()
-    await message.reply("Создание отменено.", reply_markup=admin_menu_kb())
+    await ui.reply(message, "Создание отменено.", reply_markup=admin_menu_kb())
 
 
 def calendar_kb(year, month, token):
@@ -285,14 +296,16 @@ async def wizard_view(state, stage):
         rows = [[("К старту", p + "deadline:0"), ("За 1 час", p + "deadline:1"), ("За 2 часа", p + "deadline:2")],
                 [("За 6 часов", p + "deadline:6"), ("За 12 часов", p + "deadline:12"), ("За сутки", p + "deadline:24")],
                 [("⬅️ Время", p + "back:hour"), ("❌ Отмена", "admin:menu")]]
-        return f"⏳ <b>{name} · шаг 4/5</b>\nК какому моменту попросить пилотов подтвердить участие?\nРегистрацию ты закрываешь вручную кнопкой.", buttons(rows)
+        return (f"⏳ <b>{name} · шаг 4/5</b>\nЗа сколько до старта <b>закрыть регистрацию</b>?\n"
+                "В это время бот сам завершит регистрацию и проведёт жеребьёвку резервов. "
+                "Закрыть раньше можно вручную кнопкой «✅ Завершить регистрацию»."), buttons(rows)
     await state.set_state(Flow.race_review)
     race_at = datetime.fromisoformat(data['gp_at'])
     deadline = race_at - timedelta(hours=data['gp_hours'])
     return (
         f"🏁 <b>Проверь Гран-при · шаг 5/5</b>\n\nНазвание: <b>{name}</b>\n"
         f"📅 Старт: <b>{race_at:%d.%m.%Y %H:%M} МСК</b>\n"
-        f"⏳ Подтверждение до: {deadline:%d.%m.%Y %H:%M} МСК\n\n"
+        f"🔒 Регистрация закроется автоматически: {deadline:%d.%m.%Y %H:%M} МСК\n\n"
         "После нажатия откроется регистрация, объявление появится в теме мероприятий, "
         "основа и резерв получат личные уведомления. Фактический старт гонки объявляется отдельно.",
         buttons([[("✅ Объявить и открыть регистрацию", p + "publish")],
@@ -306,11 +319,11 @@ async def wizard_name(message: Message, state: FSMContext):
         return
     name = message.text.strip()
     if not 1 <= len(name) <= 120 or '\n' in name:
-        await message.reply("Пришли название одной строкой, не длиннее 120 символов.")
+        await ui.reply(message, "Пришли название одной строкой, не длиннее 120 символов.")
         return
     await state.update_data(gp_name=name)
     text, kb = await wizard_view(state, "date")
-    await message.answer(text, reply_markup=kb)
+    await ui.answer(message, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("gpw:"))
@@ -413,12 +426,15 @@ async def reopen_registration(bot, rid, thread_id=None):
         await db.execute("UPDATE entries SET status='queued',assigned_team=NULL,replaces=NULL,marked_at=NULL "
                          "WHERE race_id=? AND driver_id IN (SELECT driver_id FROM reserve_queue WHERE race_id=?)", (rid,rid))
         await db.execute("UPDATE entries SET status='pending' WHERE race_id=? AND status='missed'", (rid,))
-        await db.execute("UPDATE races SET reg_closed=0,thread_id=COALESCE(?,thread_id) WHERE id=?", (thread_id,rid))
+        await db.execute("UPDATE races SET reg_closed=0,reminder_sent=0,auto_close=0,thread_id=COALESCE(?,thread_id) WHERE id=?", (thread_id,rid))
+        await db.execute("DELETE FROM final_checks WHERE race_id=?", (rid,))
         await db.commit()
     text = f"🟢 Регистрация на <b>{esc(name)}</b> открыта повторно. Резервы возвращены в очередь, назначения отменены."
     group_sent = await send_race_message(bot,rid,text)
     sent, failed, unlinked = await notify_all_drivers(bot,text)
-    return "✅ Регистрация открыта повторно.\n" + delivery_report(sent,failed,unlinked,group_sent)
+    return ("✅ Регистрация открыта повторно.\n⚠️ Автозакрытие для этого этапа выключено — "
+            "закрой регистрацию вручную кнопкой «✅ Завершить регистрацию».\n"
+            + delivery_report(sent,failed,unlinked,group_sent))
 
 
 async def announce_start(bot, rid=None):
@@ -455,7 +471,14 @@ async def run_race_action(bot, action, rid, thread_id=None):
         async with connect() as db:
             cur = await db.execute("UPDATE races SET active=0 WHERE id=? AND active=1", (rid,))
             await db.commit()
-        return "🏁 Этап завершён. Теперь можно объявить следующий Гран-при." if cur.rowcount else "Этот этап уже завершён."
+        if not cur.rowcount:
+            return "Этот этап уже завершён."
+        # Статусы этапа (подтвердил / готов заменить / вылетел / замены) больше не нужны
+        removed = await purge_service(bot, rid)
+        # У пилотов на главном экране пропадают «Едет / Готов заменить» этого этапа
+        refreshed = await refresh_home_screens(bot)
+        return ("🏁 Этап завершён. Теперь можно объявить следующий Гран-при.\n"
+                f"🧹 Удалено служебных сообщений: {removed}. Обновлено экранов пилотов: {refreshed}.")
     return "Неизвестное действие."
 
 
@@ -521,13 +544,15 @@ async def cmd_race_action(message: Message, state: FSMContext):
     action={'close':'close','reopen':'reopen','race_start':'start','finish':'finish'}[command]
     rid=await _active_race_id()
     if not rid:
-        await message.reply("Активного этапа нет. Нажми «➕ Объявить Гран-при».",reply_markup=admin_menu_kb())
+        await ui.reply(message, "Активного этапа нет. Нажми «➕ Объявить Гран-при».",reply_markup=admin_menu_kb())
         return
-    await message.reply("⏳ Выполняю действие…")
+    await ui.reply(message, "⏳ Выполняю действие…")
     thread=EVENTS_THREAD_ID or (message.message_thread_id if message.chat.id==GROUP_ID else None)
     result=await run_race_action(message.bot,action,rid,thread)
-    for page in message_pages(result):
-        await message.reply(page,reply_markup=admin_menu_kb())
+    pages=message_pages(result)
+    await ui.reply(message, pages[0],reply_markup=admin_menu_kb())
+    for page in pages[1:]:
+        await message.answer(page)
 
 
 @router.callback_query(F.data == "admin:team:new")
@@ -562,7 +587,9 @@ async def driver_profile(message: Message, state: FSMContext):
     game_nick, display_name, car_number = parsed
     error = car_number_error(car_number)
     if error:
-        await send_with_photo(message, "⚠️ " + error + "\n\nДопустимые номера: " + ALLOWED_CAR_NUMBERS_TEXT, admin_back_kb())
+        async with connect() as db:
+            free = await free_car_numbers(db)
+        await send_with_photo(message, "⚠️ " + error + "\n\n" + free_numbers_text(free), admin_back_kb())
         return
     await state.update_data(game_nick=game_nick, display_name=display_name, car_number=car_number)
     await state.set_state(None)

@@ -45,6 +45,17 @@ def create_dispatcher():
     return dp
 
 
+async def final_check_loop(bot: Bot) -> None:
+    """Раз в минуту: автозакрытие регистрации по времени."""
+    from app.race_ops import auto_close_due
+    while True:
+        try:
+            await auto_close_due(bot)
+        except Exception:
+            log.exception("Ошибка автозакрытия регистрации")
+        await asyncio.sleep(60)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     log.info("F1 bot: мастер Гран-при v2; admin=%s; keyboards=%s", admin.__file__, admin.admin_menu_kb.__module__)
@@ -53,7 +64,11 @@ async def main() -> None:
     await init_db()
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        reminders = asyncio.create_task(final_check_loop(bot))
+        try:
+            await dp.start_polling(bot)
+        finally:
+            reminders.cancel()
     finally:
         await bot.session.close()
 
