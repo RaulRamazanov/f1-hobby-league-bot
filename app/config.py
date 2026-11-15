@@ -7,7 +7,12 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 DB_PATH = BASE_DIR.parent / "bot.db"
-F1_PHOTO = ASSETS_DIR / "f1.jpg"
+# Основное фото бота (если balera.png нет на сервере — используется старое f1.jpg)
+F1_PHOTO = ASSETS_DIR / "balera.png"
+if not F1_PHOTO.exists():
+    F1_PHOTO = ASSETS_DIR / "f1.jpg"
+# Загруженные админом фото (расписание, таблицы)
+MEDIA_DIR = BASE_DIR.parent / "media"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GROUP_ID = int(os.getenv("GROUP_ID", "0"))
