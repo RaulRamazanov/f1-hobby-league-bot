@@ -1,4 +1,11 @@
+# секреты и данные — никогда не в git
 .env
+*.db
+*.db-journal
+*.db.bak*
+media/
+
+# окружение и кэш
 .venv/
 __pycache__/
-*.db
+*.pyc

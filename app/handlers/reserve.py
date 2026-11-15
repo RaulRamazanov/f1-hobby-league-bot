@@ -9,8 +9,9 @@ from aiogram.types import CallbackQuery
 from app.config import ADMIN_IDS
 from app.db import connect
 from app.defaults import DEFAULT_TEAMS, GRID_CAPACITY, MAX_MAINS_PER_TEAM
-from app.events import send_race_message, safe_send, notify_going_drivers
+from app.events import send_race_message, safe_send, notify_going_drivers, answer_or_message, service_to_admins
 from app.handlers.common import _show_profile
+from app.race_ops import join_standby
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ async def cb_reserve_ready(call: CallbackQuery):
     async with connect() as db:
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
-            "SELECT d.id, d.display_name, r.id, r.name, r.reg_closed FROM drivers d "
+            "SELECT d.id, d.display_name, r.id, r.name, r.reg_closed, r.started FROM drivers d "
             "JOIN races r ON r.active=1 WHERE d.tg_id=? AND d.role='reserve'",
             (call.from_user.id,),
         )
@@ -34,9 +35,37 @@ async def cb_reserve_ready(call: CallbackQuery):
         if not row:
             await call.answer("Нет активного этапа или ты не резерв", show_alert=True)
             return
-        driver_id, name, race_id, race_name, closed = row
+        driver_id, name, race_id, race_name, closed, started = row
+        cur = await db.execute(
+            "SELECT status FROM entries WHERE race_id=? AND driver_id=?", (race_id, driver_id)
+        )
+        entry = await cur.fetchone()
+        status = entry[0] if entry else None
+        if status == "banned":
+            await call.answer("Ты пропускаешь этот этап по решению админа (штраф)", show_alert=True)
+            return
         if closed:
-            await call.answer("Регистрация завершена", show_alert=True)
+            await db.rollback()
+            if started:
+                await call.answer("Гонка уже началась", show_alert=True)
+                return
+            if status == "going":
+                await call.answer("Ты уже в составе этого этапа ✅", show_alert=True)
+                return
+            if status == "unused":
+                await call.answer("Ты уже в листе ожидания 🟢")
+                await _show_profile(call.message, driver_id, edit=True)
+                return
+            # Регистрация закрыта, гонка не началась: встаём в лист ожидания.
+            assignments = await join_standby(call.bot, driver_id, race_id, race_name, name)
+            got = any(a["driver_id"] == driver_id for a in assignments)
+            await answer_or_message(
+                call,
+                "Тебе досталось свободное место! 🏎" if got
+                else "Ты в листе ожидания: если кто-то откажется — место может стать твоим 🟢",
+                show_alert=got,
+            )
+            await _show_profile(call.message, driver_id, edit=True)
             return
         cur = await db.execute(
             "INSERT OR IGNORE INTO reserve_queue (race_id, driver_id) VALUES (?, ?)",
@@ -53,7 +82,7 @@ async def cb_reserve_ready(call: CallbackQuery):
     await call.answer("Ты в списке готовых заменить 🟢")
     if added:
         await send_race_message(call.bot, race_id,
-                                f"🟢 Резерв <b>{esc(name)}</b> готов заменить на <b>{esc(race_name)}</b>.")
+                                f"🟢 Резерв <b>{esc(name)}</b> готов заменить на <b>{esc(race_name)}</b>.", service=True)
     await _show_profile(call.message, driver_id, edit=True)
 
 
@@ -62,7 +91,7 @@ async def cb_reserve_cancel(call: CallbackQuery):
     async with connect() as db:
         await db.execute("BEGIN IMMEDIATE")
         cur = await db.execute(
-            "SELECT d.id, d.display_name, r.id, r.name, r.reg_closed FROM drivers d "
+            "SELECT d.id, d.display_name, r.id, r.name, r.reg_closed, r.started FROM drivers d "
             "JOIN races r ON r.active=1 WHERE d.tg_id=? AND d.role='reserve'",
             (call.from_user.id,),
         )
@@ -70,9 +99,30 @@ async def cb_reserve_cancel(call: CallbackQuery):
         if not row:
             await call.answer("Нет активного этапа", show_alert=True)
             return
-        driver_id, name, race_id, race_name, closed = row
+        driver_id, name, race_id, race_name, closed, started = row
         if closed:
-            await call.answer("Регистрация завершена", show_alert=True)
+            cur = await db.execute(
+                "SELECT status FROM entries WHERE race_id=? AND driver_id=?", (race_id, driver_id)
+            )
+            entry = await cur.fetchone()
+            status = entry[0] if entry else None
+            if started or status != "unused":
+                await call.answer(
+                    "Ты уже в составе — чтобы отказаться, нажми «Отказаться от участия» в профиле"
+                    if status == "going" and not started else "Регистрация завершена",
+                    show_alert=True,
+                )
+                return
+            # Выход из листа ожидания после закрытия регистрации
+            await db.execute(
+                "UPDATE entries SET status='not_going' WHERE race_id=? AND driver_id=? AND status='unused'",
+                (race_id, driver_id),
+            )
+            await db.commit()
+            await call.answer("Ты вышел из листа ожидания")
+            await send_race_message(call.bot, race_id,
+                                    f"⚪ Резерв <b>{esc(name)}</b> вышел из листа ожидания на <b>{esc(race_name)}</b>.", service=True)
+            await _show_profile(call.message, driver_id, edit=True)
             return
         cur = await db.execute(
             "DELETE FROM reserve_queue WHERE race_id=? AND driver_id=?", (race_id, driver_id)
@@ -86,7 +136,7 @@ async def cb_reserve_cancel(call: CallbackQuery):
     await call.answer("Готовность снята")
     if removed:
         await send_race_message(call.bot, race_id,
-                                f"⚪ Резерв <b>{esc(name)}</b> снял готовность на <b>{esc(race_name)}</b>.")
+                                f"⚪ Резерв <b>{esc(name)}</b> снял готовность на <b>{esc(race_name)}</b>.", service=True)
     await _show_profile(call.message, driver_id, edit=True)
 
 
@@ -149,7 +199,7 @@ async def finish_registration(bot: Bot, race_id: int) -> str | None:
                 return f"⚠️ В {esc(team_name)} больше двух участников. Исправь состав."
             free = MAX_MAINS_PER_TEAM - len(occupants)
             absent = [e for e in entries if e[3] == team_id and e[4] == 'main'
-                      and e[5] in ('missed', 'not_going')]
+                      and e[5] in ('missed', 'not_going', 'banned')]
             slots.extend((e[0], e[1], e[2], team_id, team_name) for e in absent[:free])
             # Места, за которыми вообще ещё не закреплён основной пилот.
             slots.extend((None, None, None, team_id, team_name)
@@ -200,7 +250,9 @@ async def finish_registration(bot: Bot, race_id: int) -> str | None:
         await dm(slot[2], f"ℹ️ Ты не участвуешь в <b>{esc(race_name)}</b> — регистрация завершена.")
     for res in unused:
         await dm(res[2], f"ℹ️ Регистрация на <b>{esc(race_name)}</b> завершена. "
-                        "Свободных мест на всех не хватило — в этот раз ты не едешь.")
+                        "Свободных мест на всех не хватило — ты в <b>листе ожидания</b>. "
+                        "Если кто-то из состава откажется до старта, его место случайно "
+                        "достанется одному из резервов в ожидании.")
 
     # --- рассылка "ты едешь: включи телеметрию, проверь номер" (с фото и кнопкой) ---
     try:
@@ -220,7 +272,7 @@ async def finish_registration(bot: Bot, race_id: int) -> str | None:
     else:
         lines.append("Назначений резервов нет.")
     if unused:
-        lines += ["", "💤 <b>Не хватило места:</b>"]
+        lines += ["", "💤 <b>Лист ожидания (заменят отказавшихся до старта):</b>"]
         lines.extend(f"• {esc(res[1])}" for res in unused)
     summary = "\n".join(lines)
     await send_race_message(bot, race_id, summary)
@@ -271,8 +323,7 @@ async def cb_ack(call: CallbackQuery):
         f"🏎 Команда: <b>{esc(team_name) if team_name else '—'}</b>\n"
         f"💬 TG: <a href='tg://user?id={tg_id}'>профиль</a> · <code>{tg_id}</code>"
     )
-    for admin_id in ADMIN_IDS:
-        await safe_send(call.bot, admin_id, text)
+    await service_to_admins(call.bot, race_id, text)
 
     try:
         await call.message.edit_text("✅ <b>Ознакомился</b> · спасибо!")

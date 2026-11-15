@@ -9,7 +9,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.types import FSInputFile, InputMediaPhoto
 
-from app.config import GROUP_ID, EVENTS_THREAD_ID, REGISTRATION_THREAD_ID
+from app.config import GROUP_ID, EVENTS_THREAD_ID, REGISTRATION_THREAD_ID, ADMIN_IDS
 from app.db import connect
 from app.defaults import DEFAULT_TEAMS, GRID_CAPACITY, MAX_MAINS_PER_TEAM
 from app.keyboards import main_menu_kb
@@ -52,8 +52,8 @@ def message_pages(text: str, limit: int = 3500) -> list[str]:
 async def safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
     for attempt in range(3):
         try:
-            await bot.send_message(chat_id, text, **kwargs)
-            return True
+            msg = await bot.send_message(chat_id, text, **kwargs)
+            return msg or True
         except TelegramRetryAfter as exc:
             if attempt == 2:
                 break
@@ -65,7 +65,62 @@ async def safe_send(bot: Bot, chat_id: int, text: str, **kwargs) -> bool:
     return False
 
 
-async def send_race_message(bot: Bot, race_id: int, text: str) -> bool:
+async def answer_or_message(call, text: str, show_alert: bool = False) -> None:
+    """Ответ на нажатие кнопки. Если долгое действие (рассылка с фото) не уложилось
+    в окно Telegram для callback, присылаем тот же текст обычным сообщением."""
+    try:
+        await call.answer(text, show_alert=show_alert)
+    except TelegramAPIError:
+        try:
+            await call.message.answer(text)
+        except TelegramAPIError as exc:
+            log.warning("Не удалось ответить пользователю: %s", exc)
+
+
+async def track_service(race_id: int | None, msg) -> None:
+    """Запоминает служебное сообщение этапа, чтобы удалить его после «Завершить этап»."""
+    mid = getattr(msg, "message_id", None)
+    chat = getattr(msg, "chat", None)
+    if not race_id or not mid or chat is None:
+        return
+    async with connect() as db:
+        await db.execute("INSERT INTO service_msgs (race_id, chat_id, message_id) VALUES (?, ?, ?)",
+                         (race_id, chat.id, mid))
+        await db.commit()
+
+
+async def service_dm(bot: Bot, race_id: int | None, chat_id: int, text: str, **kwargs):
+    """Личное служебное сообщение (обычно админу), удаляется после завершения этапа."""
+    msg = await safe_send(bot, chat_id, text, **kwargs)
+    if msg:
+        await track_service(race_id, msg)
+    return msg
+
+
+async def service_to_admins(bot: Bot, race_id: int | None, text: str) -> None:
+    for admin_id in ADMIN_IDS:
+        await service_dm(bot, race_id, admin_id, text)
+
+
+async def purge_service(bot: Bot, race_id: int) -> int:
+    """Удаляет служебные сообщения этапа (Telegram даёт удалить сообщения младше 48 часов)."""
+    async with connect() as db:
+        cur = await db.execute("SELECT chat_id, message_id FROM service_msgs WHERE race_id=?", (race_id,))
+        rows = await cur.fetchall()
+        await db.execute("DELETE FROM service_msgs WHERE race_id=?", (race_id,))
+        await db.commit()
+    deleted = 0
+    for chat_id, message_id in rows:
+        try:
+            await bot.delete_message(chat_id, message_id)
+            deleted += 1
+        except TelegramAPIError as exc:
+            log.debug("Не удалось удалить служебное %s/%s: %s", chat_id, message_id, exc)
+        await asyncio.sleep(0.03)
+    return deleted
+
+
+async def send_race_message(bot: Bot, race_id: int, text: str, service: bool = False) -> bool:
     if not GROUP_ID:
         return False
     async with connect() as db:
@@ -84,7 +139,9 @@ async def send_race_message(bot: Bot, race_id: int, text: str) -> bool:
     delivered = True
     for page in message_pages(text):
         ok = await safe_send(bot, GROUP_ID, page, message_thread_id=thread_id or None)
-        delivered = delivered and ok
+        if ok and service:
+            await track_service(race_id, ok)
+        delivered = delivered and bool(ok)
     return delivered
 
 
@@ -105,10 +162,15 @@ async def notify_all_drivers(bot: Bot, text: str) -> tuple[int, int, int]:
     return sent, failed, unlinked
 
 
-async def notify_going_drivers(bot: Bot, race_id: int) -> tuple[int, int, int]:
+async def notify_going_drivers(
+    bot: Bot, race_id: int, driver_ids: list[int] | None = None
+) -> tuple[int, int, int]:
     """Рассылка пилотам, у кого на этот этап статус 'going':
     - media group из tutor1.jpg + tutor2.jpg с подписью-инструкцией
     - отдельное сообщение с кнопкой «Ознакомился»
+
+    driver_ids — если задан, шлём только этим пилотам (например, резерву,
+    который занял освободившееся место после закрытия регистрации).
 
     Возвращает (sent, failed, no_tg).
     """
@@ -126,6 +188,9 @@ async def notify_going_drivers(bot: Bot, race_id: int) -> tuple[int, int, int]:
             (race_id,),
         )
         rows = await cur.fetchall()
+    if driver_ids is not None:
+        wanted = set(driver_ids)
+        rows = [r for r in rows if r[0] in wanted]
 
     sent = failed = no_tg = 0
     has_p1 = TUTOR1_PATH.exists()
@@ -219,14 +284,16 @@ async def race_status_pages() -> list[str]:
     async with connect() as db:
         cur = await db.execute(
             "SELECT id, name, race_at, main_deadline, active, reg_closed, started "
-            "FROM races ORDER BY active DESC, id DESC LIMIT 1"
+            "FROM races WHERE active=1 ORDER BY id DESC LIMIT 1"
         )
         race = await cur.fetchone()
         if not race:
+            # Завершённые этапы не показываем — только активный
             return [
                 "📊 <b>Статус Гран-при</b>\n"
                 "━━━━━━━━━━━━━━━━\n\n"
-                "Гран-при пока не создан."
+                "😴 <b>Активного Гран-при сейчас нет.</b>\n"
+                "Как только админ объявит новый этап — придёт уведомление."
             ]
         rid, name, race_at_iso, deadline_iso, active, closed, started = race
 
@@ -275,6 +342,7 @@ async def race_status_pages() -> list[str]:
     offered = sum(e[4] == "offered" for e in entries)
     missed = sum(e[4] in ("missed", "not_going") for e in entries)
     unused = sum(e[4] == "unused" for e in entries)
+    banned = sum(e[4] == "banned" for e in entries)
     free_seats = max(0, GRID_CAPACITY - occupied)
 
     lines = [
@@ -282,7 +350,7 @@ async def race_status_pages() -> list[str]:
         "━━━━━━━━━━━━━━━━",
         f"🏁 <b>{esc(name)}</b>",
         f"📅 Старт: <b>{race_at:%d.%m.%Y %H:%M} МСК</b>  ·  {to_race}",
-        f"⏳ Подтверждение: {deadline:%d.%m.%Y %H:%M} МСК  ·  {to_deadline}",
+        f"🔒 Закрытие регистрации: {deadline:%d.%m.%Y %H:%M} МСК  ·  {to_deadline}",
         f"📌 Фаза: <b>{phase_txt}</b>",
         "",
         "📈 <b>Сводка</b>",
@@ -292,11 +360,14 @@ async def race_status_pages() -> list[str]:
         f"🟢 Резервов в очереди: <b>{queued}</b>"
         + (f"\n📨 Ждут оффер: <b>{offered}</b>" if offered else "")
         + (f"\n❌ Отказались / пропустили: <b>{missed}</b>" if missed else "")
-        + (f"\n💤 Резервов без места: <b>{unused}</b>" if unused else ""),
+        + (f"\n💤 Лист ожидания: <b>{unused}</b>" if unused else "")
+        + (f"\n🚫 Пропуск по штрафу: <b>{banned}</b>" if banned else ""),
     ]
 
     if not closed and active:
         lines += ["", "ℹ️ <i>Неподтверждённые места сохраняются за основой до закрытия регистрации.</i>"]
+    elif closed and active and not started:
+        lines += ["", "ℹ️ <i>Если кто-то откажется до старта, его место случайно получит резерв из листа ожидания.</i>"]
 
     lines += ["", "🏎 <b>Состав по командам</b>"]
     for team in DEFAULT_TEAMS:
@@ -319,7 +390,8 @@ async def race_status_pages() -> list[str]:
         ("offered",   "📨 <b>Ждут оффер</b>"),
         ("not_going", "❌ <b>Отказались</b>"),
         ("missed",    "⌛ <b>Не подтвердили</b>"),
-        ("unused",    "💤 <b>Резерв: мест не хватило</b>"),
+        ("unused",    "💤 <b>Лист ожидания резервов</b>"),
+        ("banned",    "🚫 <b>Пропуск по штрафу</b>"),
     ]
     for status, title in sections:
         selected = [e for e in entries if e[4] == status]

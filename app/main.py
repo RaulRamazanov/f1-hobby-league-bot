@@ -10,7 +10,8 @@ from aiogram.types import ErrorEvent
 
 from app.config import BOT_TOKEN
 from app.db import init_db
-from app.handlers import common, admin, roster, driver, reserve, register
+from app.ui import CleanPrivateInput
+from app.handlers import common, admin, roster, driver, reserve, register, penalties, lobby, swap, media, group_guard
 
 log = logging.getLogger(__name__)
 
@@ -39,10 +40,38 @@ def create_dispatcher():
     # от двойных нажатий. Изменения базы отдельно защищены транзакциями.
     dp = Dispatcher(events_isolation=SimpleEventIsolation())
     # Команды и мастер админа должны обрабатываться до приёма анкет в группе.
-    for module in (admin, roster, driver, reserve, register, common):
+    # group_guard первым: пользовательские команды в группе удаляются.
+    dp.message.outer_middleware(CleanPrivateInput())
+    for module in (group_guard, admin, roster, penalties, lobby, swap, media, driver, reserve, register, common):
         dp.include_router(module.router)
     dp.errors.register(report_error)
     return dp
+
+
+async def final_check_loop(bot: Bot) -> None:
+    """Раз в минуту: автозакрытие регистрации по времени."""
+    from app.race_ops import auto_close_due
+    while True:
+        try:
+            await auto_close_due(bot)
+        except Exception:
+            log.exception("Ошибка автозакрытия регистрации")
+        await asyncio.sleep(60)
+
+
+async def setup_commands(bot: Bot) -> None:
+    """Меню команд: пользовательские — только в личке, в группах подсказок нет."""
+    from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command="start", description="Мой профиль"),
+             BotCommand(command="status", description="Статус Гран-при"),
+             BotCommand(command="help", description="Как пользоваться ботом")],
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        await bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
+    except TelegramAPIError as exc:
+        log.warning("Не удалось обновить меню команд: %s", exc)
 
 
 async def main() -> None:
@@ -53,7 +82,12 @@ async def main() -> None:
     await init_db()
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        await setup_commands(bot)
+        reminders = asyncio.create_task(final_check_loop(bot))
+        try:
+            await dp.start_polling(bot)
+        finally:
+            reminders.cancel()
     finally:
         await bot.session.close()
 

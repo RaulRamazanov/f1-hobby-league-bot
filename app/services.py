@@ -1,7 +1,36 @@
 """Общая логика создания пилота — одна «гребёнка» для заявок и ручного добавления."""
 import aiosqlite
 
-from app.defaults import MAX_MAINS_PER_TEAM, DEFAULT_TEAMS, car_number_error
+from app.config import ADMIN_IDS
+from app.defaults import MAX_MAINS_PER_TEAM, DEFAULT_TEAMS, ALLOWED_CAR_NUMBERS, car_number_error
+
+
+async def free_car_numbers(db: aiosqlite.Connection, exclude_driver_id: int | None = None) -> list[int]:
+    """Допустимые номера, которые не заняты пилотами и не забронированы висящими заявками."""
+    taken: set[int] = set()
+    cur = await db.execute("SELECT id, car_number FROM drivers")
+    for did, number in await cur.fetchall():
+        if did != exclude_driver_id:
+            taken.add(number)
+    cur = await db.execute("SELECT car_number FROM registration_requests")
+    taken.update(r[0] for r in await cur.fetchall())
+    return sorted(ALLOWED_CAR_NUMBERS - taken)
+
+
+def admins_links() -> str:
+    links = [f"<a href='tg://user?id={aid}'>админ {i}</a>" for i, aid in enumerate(ADMIN_IDS, 1)]
+    return ", ".join(links) if links else "админам лиги"
+
+
+def free_numbers_text(free: list[int]) -> str:
+    """Подсказка со свободными номерами или сообщение, что номера закончились."""
+    if free:
+        return "🆓 <b>Свободные номера:</b>\n" + ", ".join(map(str, free))
+    return (
+        "😔 <b>Свободных номеров не осталось.</b>\n"
+        f"Напиши админам ({admins_links()}) — они освободят номер, "
+        "после этого пришли анкету ещё раз."
+    )
 
 
 async def create_driver(
