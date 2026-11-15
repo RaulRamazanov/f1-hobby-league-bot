@@ -10,7 +10,7 @@ from aiogram.types import ErrorEvent
 
 from app.config import BOT_TOKEN
 from app.db import init_db
-from app.handlers import common, admin, roster, driver, reserve, register, penalties, lobby
+from app.handlers import common, admin, roster, driver, reserve, register, penalties, lobby, swap
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ def create_dispatcher():
     # от двойных нажатий. Изменения базы отдельно защищены транзакциями.
     dp = Dispatcher(events_isolation=SimpleEventIsolation())
     # Команды и мастер админа должны обрабатываться до приёма анкет в группе.
-    for module in (admin, roster, penalties, lobby, driver, reserve, register, common):
+    for module in (admin, roster, penalties, lobby, swap, driver, reserve, register, common):
         dp.include_router(module.router)
     dp.errors.register(report_error)
     return dp
