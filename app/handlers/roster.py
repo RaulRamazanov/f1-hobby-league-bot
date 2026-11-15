@@ -10,12 +10,14 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.config import ADMIN_IDS
 from app.db import connect
-from app.defaults import MAX_MAINS_PER_TEAM, DEFAULT_TEAMS, car_number_error, ALLOWED_CAR_NUMBERS_TEXT
+from app.defaults import MAX_MAINS_PER_TEAM, DEFAULT_TEAMS, car_number_error
 from app.handlers.common import edit_or_send, send_with_photo
 from app.keyboards import team_pick_kb
-from app.services import teams_with_counts
+from app.services import teams_with_counts, free_car_numbers, free_numbers_text
 
 log = logging.getLogger(__name__)
+from app import ui
+
 router = Router()
 
 PAGE_SIZE = 8
@@ -184,8 +186,10 @@ async def cb_to_reserve(call: CallbackQuery):
         cur = await db.execute("SELECT id FROM races WHERE active=1")
         race = await cur.fetchone()
         if race:
+            # Штрафной пропуск этапа сохраняется при смене роли
             await db.execute(
-                "DELETE FROM entries WHERE race_id=? AND driver_id=?", (race[0], driver_id)
+                "DELETE FROM entries WHERE race_id=? AND driver_id=? AND status!='banned'",
+                (race[0], driver_id),
             )
         await db.execute("UPDATE entries SET replaces=NULL WHERE replaces=?", (driver_id,))
         await db.commit()
@@ -274,12 +278,19 @@ async def cb_set_team(call: CallbackQuery):
                     "DELETE FROM reserve_queue WHERE race_id=? AND driver_id=?",
                     (race_id, driver_id),
                 )
+                cur = await db.execute(
+                    "SELECT status FROM entries WHERE race_id=? AND driver_id=?", (race_id, driver_id)
+                )
+                prev = await cur.fetchone()
                 await db.execute(
                     "DELETE FROM entries WHERE race_id=? AND driver_id=?", (race_id, driver_id)
                 )
+                # Штрафной пропуск этапа сохраняется при смене роли
+                new_status = "banned" if prev and prev[0] == "banned" else (
+                    "going" if reg_closed else "pending")
                 await db.execute(
                     "INSERT INTO entries (race_id, driver_id, status) VALUES (?, ?, ?)",
-                    (race_id, driver_id, "going" if reg_closed else "pending"),
+                    (race_id, driver_id, new_status),
                 )
 
         cur = await db.execute("SELECT name FROM teams WHERE id=?", (team_id,))
@@ -307,9 +318,11 @@ async def cb_num(call: CallbackQuery, state: FSMContext):
     driver_id = int(call.data.split(":")[2])
     await state.set_state(RosterFlow.number)
     await state.update_data(driver_id=driver_id)
+    async with connect() as db:
+        free = await free_car_numbers(db)
     await edit_or_send(
         call,
-        "🔢 Пришли новый номер болида из списка:\n" + ALLOWED_CAR_NUMBERS_TEXT,
+        "🔢 Пришли новый номер болида.\n\n" + free_numbers_text(free),
         InlineKeyboardMarkup(inline_keyboard=[[_btn("⬅️ Отмена", f"ros:d:{driver_id}")]]),
     )
 
@@ -328,11 +341,13 @@ async def msg_num(message: Message, state: FSMContext):
     try:
         number = int(raw)
     except ValueError:
-        await message.answer("⚠️ Пришли номер целым числом.")
+        await ui.answer(message, "⚠️ Пришли номер целым числом.")
         return
     error = car_number_error(number)
     if error:
-        await message.answer("⚠️ " + error + "\n\nДопустимые номера: " + ALLOWED_CAR_NUMBERS_TEXT)
+        async with connect() as db:
+            free = await free_car_numbers(db, exclude_driver_id=driver_id)
+        await ui.answer(message, "⚠️ " + error + "\n\n" + free_numbers_text(free))
         return
 
     async with connect() as db:
@@ -345,7 +360,11 @@ async def msg_num(message: Message, state: FSMContext):
             cur = await db.execute(q, params)
             owner = await cur.fetchone()
             if owner:
-                await message.answer(f"⚠️ Номер #{number} уже занят: {esc(owner[0])}. Пришли другой.")
+                free = await free_car_numbers(db, exclude_driver_id=driver_id)
+                await ui.answer(message, 
+                    f"⚠️ Номер #{number} уже занят: {esc(owner[0])}. Пришли другой.\n\n"
+                    + free_numbers_text(free)
+                )
                 return
         await db.execute("UPDATE drivers SET car_number=? WHERE id=?", (number, driver_id))
         await db.commit()
@@ -405,6 +424,8 @@ async def cb_del_yes(call: CallbackQuery):
         await db.execute("UPDATE entries SET replaces=NULL WHERE replaces=?", (driver_id,))
         await db.execute("DELETE FROM entries WHERE driver_id=?", (driver_id,))
         await db.execute("DELETE FROM reserve_queue WHERE driver_id=?", (driver_id,))
+        await db.execute("DELETE FROM penalties WHERE driver_id=?", (driver_id,))
+        await db.execute("DELETE FROM lobby_checks WHERE driver_id=?", (driver_id,))
         await db.execute("DELETE FROM drivers WHERE id=?", (driver_id,))
         await db.commit()
 
