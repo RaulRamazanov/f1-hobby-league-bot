@@ -62,6 +62,55 @@ CREATE TABLE IF NOT EXISTS reserve_queue (
     queued_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(race_id, driver_id)
 );
+
+-- Штрафные баллы: каждая запись — одно решение админа (points может быть < 0 — снятие)
+CREATE TABLE IF NOT EXISTS penalties (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    driver_id   INTEGER NOT NULL REFERENCES drivers(id),
+    points      INTEGER NOT NULL,
+    reason      TEXT,
+    race_ban    INTEGER NOT NULL DEFAULT 0,
+    admin_id    INTEGER,
+    created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Текущее сообщение-экран бота в личке (чтобы удалять старые)
+CREATE TABLE IF NOT EXISTS ui_screens (
+    chat_id     INTEGER PRIMARY KEY,
+    message_id  INTEGER NOT NULL
+);
+
+-- Фото расписания и турнирных таблиц (файл хранится на сервере)
+CREATE TABLE IF NOT EXISTS media (
+    key         TEXT PRIMARY KEY,
+    path        TEXT NOT NULL,
+    file_id     TEXT,
+    updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Служебные сообщения этапа (статусы, «вылетел», замены) — удаляются после «Завершить этап»
+CREATE TABLE IF NOT EXISTS service_msgs (
+    race_id     INTEGER NOT NULL,
+    chat_id     INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL
+);
+
+-- Подтверждение за час до гонки
+CREATE TABLE IF NOT EXISTS final_checks (
+    race_id     INTEGER NOT NULL,
+    driver_id   INTEGER NOT NULL,
+    answer      TEXT NOT NULL,
+    answered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (race_id, driver_id)
+);
+
+-- Отметки «Я в лобби» по этапу
+CREATE TABLE IF NOT EXISTS lobby_checks (
+    race_id     INTEGER NOT NULL REFERENCES races(id),
+    driver_id   INTEGER NOT NULL REFERENCES drivers(id),
+    checked_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (race_id, driver_id)
+);
 """
 
 
@@ -89,9 +138,18 @@ async def init_db() -> None:
         for column, definition in (
             ("thread_id", "INTEGER"),
             ("started", "INTEGER NOT NULL DEFAULT 0"),
+            ("lobby_sent_at", "TEXT"),
+            ("reminder_sent", "INTEGER NOT NULL DEFAULT 0"),
+            # 1 — регистрация закроется сама в main_deadline. У старых этапов 0 (как было — вручную).
+            ("auto_close", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in cols:
                 await db.execute(f"ALTER TABLE races ADD COLUMN {column} {definition}")
+        cur = await db.execute("PRAGMA table_info(drivers)")
+        driver_cols = {r[1] for r in await cur.fetchall()}
+        if "ban_pending" not in driver_cols:
+            # Сколько ближайших этапов пилот пропускает (штраф, назначает админ)
+            await db.execute("ALTER TABLE drivers ADD COLUMN ban_pending INTEGER NOT NULL DEFAULT 0")
         await db.commit()
     await seed_defaults()
 
